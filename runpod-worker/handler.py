@@ -24,6 +24,10 @@ INPUT_KEY_FILE = "audio_file.mp3"
 DEFAULT_MODEL = "htdemucs_ft"
 DEFAULT_SHIFTS = 4
 DEFAULT_OVERLAP = 0.25
+DEFAULT_OUTPUT_FORMAT = "mp3"
+DEFAULT_MP3_BITRATE = 320
+# Stem formats Demucs can write, mapped to the Content-Type used for the R2 upload.
+OUTPUT_CONTENT_TYPES = {"mp3": "audio/mpeg", "flac": "audio/flac", "wav": "audio/wav"}
 DEFAULT_R2_PREFIX = "stems"
 DEFAULT_URL_EXPIRY = 7 * 24 * 60 * 60  # SigV4 presigned URLs max out at 7 days
 # Guards against oversized downloads; ~20 min of 320 kbps MP3. Override with MAX_INPUT_BYTES.
@@ -107,8 +111,8 @@ class R2Storage:
     def key_for(self, job_id: str, filename: str) -> str:
         return "/".join(part for part in (self.prefix, job_id, filename) if part)
 
-    def upload(self, path: pathlib.Path, key: str) -> None:
-        self.client.upload_file(str(path), self.bucket, key, ExtraArgs={"ContentType": "audio/wav"})
+    def upload(self, path: pathlib.Path, key: str, content_type: str) -> None:
+        self.client.upload_file(str(path), self.bucket, key, ExtraArgs={"ContentType": content_type})
 
     def exists(self, key: str) -> bool:
         try:
@@ -133,16 +137,25 @@ def _progress(event: Dict[str, Any], payload: Dict[str, Any]) -> None:
         runpod.serverless.progress_update(event, payload)
 
 
+def _format_args(output_format: str, mp3_bitrate: int) -> list[str]:
+    if output_format == "mp3":
+        return ["--mp3", "--mp3-bitrate", str(mp3_bitrate)]
+    if output_format == "flac":
+        return ["--flac"]
+    return []
+
+
 def _upload_stems(
-    storage: R2Storage, stems_dir: pathlib.Path, job_id: str
+    storage: R2Storage, stems_dir: pathlib.Path, job_id: str, output_format: str
 ) -> Dict[str, Dict[str, Optional[str]]]:
     stems: Dict[str, Dict[str, Optional[str]]] = {}
-    for wav_file in sorted(stems_dir.glob("*.wav")):
-        key = storage.key_for(job_id, wav_file.name)
-        storage.upload(wav_file, key)
+    content_type = OUTPUT_CONTENT_TYPES[output_format]
+    for stem_file in sorted(stems_dir.glob(f"*.{output_format}")):
+        key = storage.key_for(job_id, stem_file.name)
+        storage.upload(stem_file, key, content_type)
         # Only hand out a URL once the object is confirmed to be in R2.
         url = storage.url_for(key) if storage.exists(key) else None
-        stems[wav_file.stem] = {"filename": wav_file.name, "key": key, "url": url}
+        stems[stem_file.stem] = {"filename": stem_file.name, "key": key, "url": url}
     return stems
 
 
@@ -155,17 +168,24 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     model_name = inputs.get("model_name", DEFAULT_MODEL)
     shifts = int(inputs.get("shifts", DEFAULT_SHIFTS))
     overlap = float(inputs.get("overlap", DEFAULT_OVERLAP))
+    output_format = str(inputs.get("output_format", DEFAULT_OUTPUT_FORMAT)).strip().lower()
+    mp3_bitrate = int(inputs.get("mp3_bitrate", DEFAULT_MP3_BITRATE))
 
     if not _is_public_url(audio_url):
         # Returning an "error" key makes RunPod mark the job FAILED.
         return {"error": "Provide 'audio_url' as a publicly reachable http(s) URL to an MP3"}
+    if output_format not in OUTPUT_CONTENT_TYPES:
+        return {"error": f"'output_format' must be one of: {', '.join(OUTPUT_CONTENT_TYPES)}"}
 
     base_payload: Dict[str, Any] = {
         "job_id": job_id,
         "model": model_name,
         "shifts": shifts,
         "overlap": overlap,
+        "output_format": output_format,
     }
+    if output_format == "mp3":
+        base_payload["mp3_bitrate"] = mp3_bitrate
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_path = pathlib.Path(tmp_dir)
@@ -190,6 +210,7 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
                 str(shifts),
                 "--overlap",
                 str(overlap),
+                *_format_args(output_format, mp3_bitrate),
                 "--out",
                 str(output_root),
                 str(audio_path),
@@ -201,7 +222,7 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
             stems_dir = _find_stems_dir(output_root, model_name)
 
             _progress(event, {**base_payload, "stage": "uploading", "stems": None})
-            stems_payload = _upload_stems(storage, stems_dir, job_id)
+            stems_payload = _upload_stems(storage, stems_dir, job_id, output_format)
             if not stems_payload:
                 return {"error": "No stems were produced"}
             missing = [name for name, stem in stems_payload.items() if not stem["url"]]

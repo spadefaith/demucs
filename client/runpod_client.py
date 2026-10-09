@@ -10,6 +10,9 @@ from dynaconf import Dynaconf
 DEFAULT_MODEL = "htdemucs_ft"
 DEFAULT_SHIFTS = 4
 DEFAULT_OVERLAP = 0.25
+DEFAULT_OUTPUT_FORMAT = "mp3"
+DEFAULT_MP3_BITRATE = 320
+OUTPUT_FORMATS = ("mp3", "flac", "wav")
 DEFAULT_API_BASE = "https://api.runpod.ai/v2"
 TERMINAL_FAILURES = ("FAILED", "CANCELLED", "TIMED_OUT")
 
@@ -29,7 +32,7 @@ def _download_stems(stems: Dict[str, Any], destination: pathlib.Path, timeout: i
         url = value.get("url") if isinstance(value, dict) else None
         if not url:
             continue
-        filename = value.get("filename") or f"{key}.wav"
+        filename = value.get("filename") or pathlib.PurePosixPath(urlparse(url).path).name or key
         output_path = destination / filename
         with requests.get(url, stream=True, timeout=timeout) as response:
             response.raise_for_status()
@@ -88,6 +91,8 @@ def main(
     model_name: str = typer.Option(DEFAULT_MODEL),
     shifts: int = typer.Option(DEFAULT_SHIFTS),
     overlap: float = typer.Option(DEFAULT_OVERLAP),
+    output_format: str = typer.Option(DEFAULT_OUTPUT_FORMAT, help="Stem format: mp3, flac, or wav"),
+    mp3_bitrate: int = typer.Option(DEFAULT_MP3_BITRATE, help="Bitrate (kbps) when --output-format is mp3"),
     wait: bool = typer.Option(True, help="Poll until the stems are in R2; --no-wait just prints the job ID"),
     poll_interval: float = typer.Option(5.0, help="Seconds between status checks"),
     max_wait: int = typer.Option(3600, help="Give up polling after this many seconds"),
@@ -117,11 +122,15 @@ def main(
             raise typer.BadParameter("Provide --audio-url (or --job-id to resume)", param_hint="--audio-url")
         if not _is_public_url(audio_url):
             raise typer.BadParameter("Must be an http(s) URL", param_hint="--audio-url")
+        if output_format not in OUTPUT_FORMATS:
+            raise typer.BadParameter(f"Must be one of: {', '.join(OUTPUT_FORMATS)}", param_hint="--output-format")
         payload: Dict[str, Any] = {
             "audio_url": audio_url,
             "model_name": model_name,
             "shifts": shifts,
             "overlap": overlap,
+            "output_format": output_format,
+            "mp3_bitrate": mp3_bitrate,
         }
 
         body = _request("POST", f"{base_url}/run", headers, timeout, json={"input": payload})

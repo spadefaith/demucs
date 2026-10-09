@@ -12,7 +12,7 @@ This repository now acts as a monorepo for three complementary flows that all re
 | --- | --- |
 | `local-run/` | Docs + separation outputs for local experimentation; uses the root `pyproject.toml`. |
 | `runpod-worker/` | Dockerfile, handler, and `runpod.yaml` describing the serverless worker. |
-| `client/` | Python CLI (`runpod-demucs`) that calls the deployed endpoint and writes WAVs. |
+| `client/` | Python CLI (`runpod-demucs`) that calls the deployed endpoint and downloads the stems (MP3 by default). |
 | `AGENTS.md` | Contributor and agent workflow guide for this repo. |
 
 UV is configured (via `uv.toml`) to keep its cache in `.uv/cache`, ensuring everything lives inside the repo; the `.uv/` directory is ignored by git.
@@ -45,7 +45,7 @@ Outputs land in `local-run/separations/<timestamp>/...`. The subdirectory README
 Key files:
 
 - `Dockerfile` – installs CUDA-enabled PyTorch 2.4.1/torchaudio 2.4.1, Demucs, ffmpeg, and the RunPod SDK.
-- `handler.py` – downloads the MP3 from a public `audio_url`, runs `demucs --name <model> --shifts --overlap`, uploads each stem to Cloudflare R2, and returns the stem URLs.
+- `handler.py` – downloads the MP3 from a public `audio_url`, runs `demucs --name <model> --shifts --overlap` (MP3 320 kbps output by default), uploads each stem to Cloudflare R2, and returns the stem URLs.
 - `runpod.yaml` – instructs RunPod to launch `handler.py` and call its `handler` function.
 
 Build/test locally:
@@ -68,7 +68,7 @@ Deploy checklist:
 | `R2_ACCOUNT_ID` | yes | Cloudflare account ID (endpoint is `https://<id>.r2.cloudflarestorage.com`). |
 | `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | yes | R2 API token with write access to the bucket. |
 | `R2_BUCKET` | yes | Bucket that receives the stems. |
-| `R2_PREFIX` | no | Key prefix, default `stems` → `stems/<job_id>/vocals.wav`. |
+| `R2_PREFIX` | no | Key prefix, default `stems` → `stems/<job_id>/vocals.mp3`. |
 | `R2_PUBLIC_BASE_URL` | no | Public bucket/custom domain; when set, URLs are `<base>/<key>` instead of presigned. |
 | `R2_URL_EXPIRY` | no | Presigned URL lifetime in seconds (default and max: 604800 = 7 days). |
 
@@ -85,12 +85,14 @@ before its URL is handed out, so once the status is `COMPLETED` the output is:
   "stage": "done",
   "job_id": "abc-123",
   "model": "htdemucs_ft",
+  "output_format": "mp3",
+  "mp3_bitrate": 320,
   "stem_count": 4,
   "stems": {
-    "vocals": {"filename": "vocals.wav", "key": "stems/abc-123/vocals.wav", "url": "https://..."},
-    "drums": {"filename": "drums.wav", "key": "stems/abc-123/drums.wav", "url": "https://..."},
-    "bass": {"filename": "bass.wav", "key": "stems/abc-123/bass.wav", "url": "https://..."},
-    "other": {"filename": "other.wav", "key": "stems/abc-123/other.wav", "url": "https://..."}
+    "vocals": {"filename": "vocals.mp3", "key": "stems/abc-123/vocals.mp3", "url": "https://..."},
+    "drums": {"filename": "drums.mp3", "key": "stems/abc-123/drums.mp3", "url": "https://..."},
+    "bass": {"filename": "bass.mp3", "key": "stems/abc-123/bass.mp3", "url": "https://..."},
+    "other": {"filename": "other.mp3", "key": "stems/abc-123/other.mp3", "url": "https://..."}
   }
 }
 ```
@@ -109,7 +111,8 @@ The only accepted input is `audio_url`: a publicly reachable `http(s)` link to a
 hosted doesn't matter, as long as the worker can `GET` it without credentials (a presigned URL is
 fine). The worker checks the file header and rejects anything that isn't MP3, and stops downloads
 over 50 MB (about 20 minutes at 320 kbps); override that with `MAX_INPUT_BYTES` on the endpoint.
-Stems are still returned as WAV.
+Stems default to MP3 at 320 kbps (~2.4 MB per minute, vs ~10 MB/min for WAV). Optional inputs:
+`"output_format"` (`mp3`, `flac`, or `wav`) and `"mp3_bitrate"` (kbps, mp3 only).
 
 ## RunPod client (`client/`)
 
@@ -125,7 +128,7 @@ uv run runpod-demucs --job-id <id>                              # resume polling
 
 Dynaconf loads `RUNPOD_API_KEY`, `RUNPOD_ENDPOINT_ID`, and `RUNPOD_ENDPOINT_URL` from your
 environment or `.env` files (see the [Dynaconf env var docs](https://www.dynaconf.com/envvars/)).
-Other knobs: `--model-name`, `--shifts`, `--overlap`, `--poll-interval`, `--max-wait`, and
+Other knobs: `--model-name`, `--shifts`, `--overlap`, `--output-format`, `--mp3-bitrate`, `--poll-interval`, `--max-wait`, and
 `--no-download` to only print URLs. `client/runpod_client.py` houses the implementation.
 
 ## Next steps
