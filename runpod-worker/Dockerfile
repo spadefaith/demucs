@@ -13,8 +13,11 @@ WORKDIR /app
 
 COPY requirements.txt /app/requirements.txt
 
-# Install CUDA-enabled PyTorch first, then the rest of the stack.
-RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu124 \
+# Install CUDA-enabled PyTorch first, then the rest of the stack. PyPI stays as an extra index so
+# torch's own dependencies (and their build backends, e.g. flit_core) still resolve.
+RUN pip install --no-cache-dir \
+    --index-url https://download.pytorch.org/whl/cu124 \
+    --extra-index-url https://pypi.org/simple \
     torch==2.4.1 \
     torchaudio==2.4.1 && \
     pip install --no-cache-dir -r /app/requirements.txt

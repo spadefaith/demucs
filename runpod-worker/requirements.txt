@@ -1,5 +1,5 @@
 boto3
-demucs
+demucs==4.0.1
 requests
 runpod
 soundfile
