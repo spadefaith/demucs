@@ -1,6 +1,7 @@
-import base64
 import pathlib
+import time
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 import requests
 import typer
@@ -10,29 +11,32 @@ DEFAULT_MODEL = "htdemucs_ft"
 DEFAULT_SHIFTS = 4
 DEFAULT_OVERLAP = 0.25
 DEFAULT_API_BASE = "https://api.runpod.ai/v2"
+TERMINAL_FAILURES = ("FAILED", "CANCELLED", "TIMED_OUT")
 
 settings = Dynaconf(envvar_prefix="RUNPOD", environments=True, load_dotenv=True)
 
-app = typer.Typer(help="Invoke the RunPod Demucs endpoint and save returned stems locally.")
+app = typer.Typer(help="Submit async Demucs jobs to RunPod and fetch the stem URLs from R2.")
 
 
-def _encode_file(path: pathlib.Path) -> str:
-    return base64.b64encode(path.read_bytes()).decode("utf-8")
+def _is_public_url(value: str) -> bool:
+    parsed = urlparse(value)
+    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
 
 
-def _write_stems(stems: Dict[str, Any], destination: pathlib.Path) -> None:
+def _download_stems(stems: Dict[str, Any], destination: pathlib.Path, timeout: int) -> None:
     destination.mkdir(parents=True, exist_ok=True)
     for key, value in stems.items():
-        if isinstance(value, dict):
-            filename = value.get("filename") or f"{key}.wav"
-            blob = value.get("base64")
-        else:
-            filename = f"{key}.wav"
-            blob = value
-        if not blob:
+        url = value.get("url") if isinstance(value, dict) else None
+        if not url:
             continue
+        filename = value.get("filename") or f"{key}.wav"
         output_path = destination / filename
-        output_path.write_bytes(base64.b64decode(blob))
+        with requests.get(url, stream=True, timeout=timeout) as response:
+            response.raise_for_status()
+            with output_path.open("wb") as file_handle:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        file_handle.write(chunk)
         typer.echo(f"wrote {output_path}")
 
 
@@ -45,20 +49,53 @@ def _resolve_option(value: Optional[str], setting_key: str) -> Optional[str]:
     return None
 
 
+def _fail(message: str) -> None:
+    typer.secho(message, err=True, fg=typer.colors.RED)
+    raise typer.Exit(code=1)
+
+
+def _request(method: str, url: str, headers: Dict[str, str], timeout: int, **kwargs: Any) -> Dict[str, Any]:
+    try:
+        response = requests.request(method, url, headers=headers, timeout=timeout, **kwargs)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        typer.secho(f"RunPod request failed: {exc}", err=True, fg=typer.colors.RED)
+        raise typer.Exit(code=1) from exc
+    return response.json()
+
+
+def _stems_ready(output: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(output, dict):
+        return None
+    stems = output.get("stems")
+    if not isinstance(stems, dict) or not stems:
+        return None
+    if all(isinstance(stem, dict) and stem.get("url") for stem in stems.values()):
+        return stems
+    return None
+
+
 @app.command()
 def main(
     api_key: Optional[str] = typer.Option(None, help="RunPod API token"),
     endpoint_id: Optional[str] = typer.Option(None, help="RunPod endpoint ID"),
-    endpoint_url: Optional[str] = typer.Option(None, help="Override full RunPod endpoint URL"),
+    endpoint_url: Optional[str] = typer.Option(
+        None, help="Override the endpoint base URL (e.g. https://api.runpod.ai/v2/<id>)"
+    ),
     api_base: str = typer.Option(DEFAULT_API_BASE, help="Base URL for RunPod API"),
-    input_file: Optional[pathlib.Path] = typer.Option(None, help="Local file path to upload"),
+    audio_url: Optional[str] = typer.Option(None, help="Publicly reachable http(s) URL of the MP3 to separate"),
+    job_id: Optional[str] = typer.Option(None, help="Resume polling an already-submitted job"),
     model_name: str = typer.Option(DEFAULT_MODEL),
     shifts: int = typer.Option(DEFAULT_SHIFTS),
     overlap: float = typer.Option(DEFAULT_OVERLAP),
-    timeout: int = typer.Option(900, help="HTTP timeout in seconds"),
+    wait: bool = typer.Option(True, help="Poll until the stems are in R2; --no-wait just prints the job ID"),
+    poll_interval: float = typer.Option(5.0, help="Seconds between status checks"),
+    max_wait: int = typer.Option(3600, help="Give up polling after this many seconds"),
+    timeout: int = typer.Option(120, help="HTTP timeout in seconds per request"),
+    download: bool = typer.Option(True, help="Download the stems from their R2 URLs once ready"),
     save_dir: pathlib.Path = typer.Option(pathlib.Path("runpod-stems"), help="Destination directory"),
 ) -> None:
-    """Call the RunPod Demucs worker via sync API and store returned stems."""
+    """Submit a job to the RunPod Demucs worker (async) and report the R2 stem URLs."""
 
     resolved_api_key = _resolve_option(api_key, "API_KEY")
     if not resolved_api_key:
@@ -72,48 +109,67 @@ def main(
             param_hint="--endpoint-url / --endpoint-id",
         )
 
-    if not input_file:
-        raise typer.BadParameter("Provide --input-file", param_hint="--input-file")
-
-    input_path = input_file.expanduser().resolve()
-    if not input_path.exists():
-        raise typer.BadParameter(f"Input file not found: {input_path}", param_hint="--input-file")
-
-    payload: Dict[str, Any] = {
-        "model_name": model_name,
-        "shifts": shifts,
-        "overlap": overlap,
-        "audio_base64": _encode_file(input_path),
-    }
-
-    target_url = resolved_endpoint_url or f"{api_base.rstrip('/')}/{resolved_endpoint_id}/runsync"
+    base_url = (resolved_endpoint_url or f"{api_base.rstrip('/')}/{resolved_endpoint_id}").rstrip("/")
     headers = {"Authorization": f"Bearer {resolved_api_key}", "Content-Type": "application/json"}
 
-    try:
-        response = requests.post(target_url, json={"input": payload}, headers=headers, timeout=timeout)
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        typer.secho(f"RunPod request failed: {exc}", err=True, fg=typer.colors.RED)
-        raise typer.Exit(code=1) from exc
+    if not job_id:
+        if not audio_url:
+            raise typer.BadParameter("Provide --audio-url (or --job-id to resume)", param_hint="--audio-url")
+        if not _is_public_url(audio_url):
+            raise typer.BadParameter("Must be an http(s) URL", param_hint="--audio-url")
+        payload: Dict[str, Any] = {
+            "audio_url": audio_url,
+            "model_name": model_name,
+            "shifts": shifts,
+            "overlap": overlap,
+        }
 
-    body = response.json()
-    output = body.get("output") or body
-    status = body.get("status") or output.get("status")
-    if status and status not in ("COMPLETED", "success", "SUCCESS"):
-        typer.secho(f"RunPod returned status {status}: {output}", err=True, fg=typer.colors.RED)
-        raise typer.Exit(code=1)
-    if output.get("status") == "error":
-        typer.secho(f"Worker error: {output.get('error')}", err=True, fg=typer.colors.RED)
-        raise typer.Exit(code=1)
+        body = _request("POST", f"{base_url}/run", headers, timeout, json={"input": payload})
+        job_id = body.get("id")
+        if not job_id:
+            _fail(f"RunPod did not return a job ID: {body}")
+        typer.secho(f"submitted job {job_id} ({body.get('status')})", fg=typer.colors.CYAN)
 
-    stems = output.get("stems")
-    if not stems:
-        typer.secho("No stems returned", err=True, fg=typer.colors.RED)
-        raise typer.Exit(code=1)
+    if not wait:
+        typer.echo(f"resume later with: runpod-demucs --job-id {job_id}")
+        return
 
-    destination = save_dir.expanduser().resolve()
-    _write_stems(stems, destination)
-    typer.secho(f"Decoded {len(stems)} stems to {destination}", fg=typer.colors.GREEN)
+    deadline = time.monotonic() + max_wait
+    last_stage: Optional[str] = None
+    stems: Optional[Dict[str, Any]] = None
+    while time.monotonic() < deadline:
+        body = _request("GET", f"{base_url}/status/{job_id}", headers, timeout)
+        status = body.get("status")
+        output = body.get("output")
+
+        if status in TERMINAL_FAILURES:
+            error = body.get("error") or (output.get("error") if isinstance(output, dict) else output)
+            _fail(f"Job {job_id} {status}: {error}")
+
+        stage = output.get("stage") if isinstance(output, dict) else None
+        if (stage or status) != last_stage:
+            typer.echo(f"{status}: {stage or 'stems=null'}")
+            last_stage = stage or status
+
+        if status == "COMPLETED":
+            stems = _stems_ready(output)
+            if stems is None:
+                _fail(f"Job {job_id} completed without stem URLs: {output}")
+            break
+
+        time.sleep(poll_interval)
+
+    if stems is None:
+        _fail(f"Timed out waiting for job {job_id}; resume with --job-id {job_id}")
+        return
+
+    for name, stem in stems.items():
+        typer.echo(f"{name}: {stem['url']}")
+
+    if download:
+        destination = save_dir.expanduser().resolve()
+        _download_stems(stems, destination, timeout)
+        typer.secho(f"Downloaded {len(stems)} stems to {destination}", fg=typer.colors.GREEN)
 
 
 if __name__ == "__main__":
