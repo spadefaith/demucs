@@ -68,7 +68,7 @@ Deploy checklist:
 | `R2_ACCOUNT_ID` | yes | Cloudflare account ID (endpoint is `https://<id>.r2.cloudflarestorage.com`). |
 | `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | yes | R2 API token with write access to the bucket. |
 | `R2_BUCKET` | yes | Bucket that receives the stems. |
-| `R2_PREFIX` | no | Key prefix, default `stems` → `stems/<job_id>/vocals.mp3`. |
+| `R2_PREFIX` | no | Key prefix, default `stems` → `stems/<name or job_id>/vocals.mp3`. |
 | `R2_PUBLIC_BASE_URL` | no | Public bucket/custom domain; when set, URLs are `<base>/<key>` instead of presigned. |
 | `R2_URL_EXPIRY` | no | Presigned URL lifetime in seconds (default and max: 604800 = 7 days). |
 
@@ -114,6 +114,8 @@ fine). The worker checks the file header and rejects anything that isn't MP3, an
 over 50 MB (about 20 minutes at 320 kbps); override that with `MAX_INPUT_BYTES` on the endpoint.
 Stems default to MP3 at 320 kbps (~2.4 MB per minute, vs ~10 MB/min for WAV). Optional inputs:
 `"output_format"` (`mp3`, `flac`, or `wav`) and `"mp3_bitrate"` (kbps, mp3 only).
+Pass `"name"` to upload into `stems/<name>/` instead of `stems/<job_id>/`; resubmitting with the same
+name overwrites those files rather than creating a new folder (it must not contain `/` or `\`).
 
 ## RunPod client (`client/`)
 

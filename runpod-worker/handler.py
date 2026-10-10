@@ -82,6 +82,18 @@ def _find_stems_dir(out_root: pathlib.Path, model_name: str) -> pathlib.Path:
     return candidates[0]
 
 
+def _folder_name(value: Any) -> Optional[str]:
+    # A single key segment; reusing the same name overwrites that folder's objects in R2.
+    if value is None:
+        return None
+    name = str(value).strip()
+    if not name:
+        return None
+    if "/" in name or "\\" in name or name in (".", ".."):
+        raise ValueError("'name' must be a single folder name without '/' or '\\'")
+    return name
+
+
 def _require_env(name: str) -> str:
     value = os.environ.get(name, "").strip()
     if not value:
@@ -109,8 +121,8 @@ class R2Storage:
             config=BotoConfig(signature_version="s3v4"),
         )
 
-    def key_for(self, job_id: str, filename: str) -> str:
-        return "/".join(part for part in (self.prefix, job_id, filename) if part)
+    def key_for(self, folder: str, filename: str) -> str:
+        return "/".join(part for part in (self.prefix, folder, filename) if part)
 
     def upload(self, path: pathlib.Path, key: str, content_type: str) -> None:
         self.client.upload_file(str(path), self.bucket, key, ExtraArgs={"ContentType": content_type})
@@ -147,9 +159,9 @@ def _format_args(output_format: str, mp3_bitrate: int) -> list[str]:
 
 
 def _upload_file(
-    storage: R2Storage, path: pathlib.Path, job_id: str, filename: str, content_type: str
+    storage: R2Storage, path: pathlib.Path, folder: str, filename: str, content_type: str
 ) -> Dict[str, Optional[str]]:
-    key = storage.key_for(job_id, filename)
+    key = storage.key_for(folder, filename)
     storage.upload(path, key, content_type)
     # Only hand out a URL once the object is confirmed to be in R2.
     url = storage.url_for(key) if storage.exists(key) else None
@@ -157,11 +169,11 @@ def _upload_file(
 
 
 def _upload_stems(
-    storage: R2Storage, stems_dir: pathlib.Path, job_id: str, output_format: str
+    storage: R2Storage, stems_dir: pathlib.Path, folder: str, output_format: str
 ) -> Dict[str, Dict[str, Optional[str]]]:
     content_type = OUTPUT_CONTENT_TYPES[output_format]
     return {
-        stem_file.stem: _upload_file(storage, stem_file, job_id, stem_file.name, content_type)
+        stem_file.stem: _upload_file(storage, stem_file, folder, stem_file.name, content_type)
         for stem_file in sorted(stems_dir.glob(f"*.{output_format}"))
     }
 
@@ -194,9 +206,15 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": "Provide 'audio_url' as a publicly reachable http(s) URL to an MP3"}
     if output_format not in OUTPUT_CONTENT_TYPES:
         return {"error": f"'output_format' must be one of: {', '.join(OUTPUT_CONTENT_TYPES)}"}
+    try:
+        name = _folder_name(inputs.get("name"))
+    except ValueError as exc:
+        return {"error": str(exc)}
+    folder = name or job_id
 
     base_payload: Dict[str, Any] = {
         "job_id": job_id,
+        "name": name,
         "model": model_name,
         "shifts": shifts,
         "overlap": overlap,
@@ -244,13 +262,13 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
             note_events_path = _transcribe_notes(audio_path, notes_root, env)
 
             _progress(event, {**base_payload, "stage": "uploading", "stems": None})
-            stems_payload = _upload_stems(storage, stems_dir, job_id, output_format)
+            stems_payload = _upload_stems(storage, stems_dir, folder, output_format)
             if not stems_payload:
                 return {"error": "No stems were produced"}
-            missing = [name for name, stem in stems_payload.items() if not stem["url"]]
+            missing = [stem_name for stem_name, stem in stems_payload.items() if not stem["url"]]
             if missing:
                 return {"error": f"Stems not found in R2 after upload: {', '.join(missing)}"}
-            note_events = _upload_file(storage, note_events_path, job_id, NOTE_EVENTS_FILENAME, "text/csv")
+            note_events = _upload_file(storage, note_events_path, folder, NOTE_EVENTS_FILENAME, "text/csv")
             if not note_events["url"]:
                 return {"error": "Note events CSV not found in R2 after upload"}
 
