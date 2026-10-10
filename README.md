@@ -44,8 +44,8 @@ Outputs land in `local-run/separations/<timestamp>/...`. The subdirectory README
 
 Key files:
 
-- `Dockerfile` – installs CUDA-enabled PyTorch 2.4.1/torchaudio 2.4.1, Demucs, ffmpeg, and the RunPod SDK.
-- `handler.py` – downloads the MP3 from a public `audio_url`, runs `demucs --name <model> --shifts --overlap` (MP3 320 kbps output by default), uploads each stem to Cloudflare R2, and returns the stem URLs.
+- `Dockerfile` – installs CUDA-enabled PyTorch 2.4.1/torchaudio 2.4.1, Demucs, Spotify Basic Pitch, ffmpeg, and the RunPod SDK.
+- `handler.py` – downloads the MP3 from a public `audio_url`, runs `demucs --name <model> --shifts --overlap` (MP3 320 kbps output by default), runs `basic-pitch --save-note-events` on the input for a note events CSV, uploads the stems and CSV to Cloudflare R2, and returns their URLs.
 - `runpod.yaml` – instructs RunPod to launch `handler.py` and call its `handler` function.
 
 Build/test locally:
@@ -76,7 +76,7 @@ Deploy checklist:
 
 Submit with `/run`; it returns a job ID immediately. Poll `/status/<job_id>`: while the job runs,
 `output` is either absent or a progress payload with `"stems": null` and a `stage`
-(`downloading` → `separating` → `uploading`). Each stem is uploaded and confirmed in R2 (`HEAD`)
+(`downloading` → `separating` → `transcribing` → `uploading`). Each file is uploaded and confirmed in R2 (`HEAD`)
 before its URL is handed out, so once the status is `COMPLETED` the output is:
 
 ```json
@@ -93,7 +93,8 @@ before its URL is handed out, so once the status is `COMPLETED` the output is:
     "drums": {"filename": "drums.mp3", "key": "stems/abc-123/drums.mp3", "url": "https://..."},
     "bass": {"filename": "bass.mp3", "key": "stems/abc-123/bass.mp3", "url": "https://..."},
     "other": {"filename": "other.mp3", "key": "stems/abc-123/other.mp3", "url": "https://..."}
-  }
+  },
+  "note_events": {"filename": "note_events.csv", "key": "stems/abc-123/note_events.csv", "url": "https://..."}
 }
 ```
 
@@ -117,7 +118,7 @@ Stems default to MP3 at 320 kbps (~2.4 MB per minute, vs ~10 MB/min for WAV). Op
 ## RunPod client (`client/`)
 
 The root `pyproject.toml` exposes a `runpod-demucs` script that submits an async job, polls until
-the stems are in R2, prints their URLs, and downloads them:
+the stems are in R2, prints their URLs, and downloads them along with `note_events.csv`:
 
 ```bash
 uv sync

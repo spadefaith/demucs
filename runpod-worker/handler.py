@@ -28,6 +28,7 @@ DEFAULT_OUTPUT_FORMAT = "mp3"
 DEFAULT_MP3_BITRATE = 320
 # Stem formats Demucs can write, mapped to the Content-Type used for the R2 upload.
 OUTPUT_CONTENT_TYPES = {"mp3": "audio/mpeg", "flac": "audio/flac", "wav": "audio/wav"}
+NOTE_EVENTS_FILENAME = "note_events.csv"
 DEFAULT_R2_PREFIX = "stems"
 DEFAULT_URL_EXPIRY = 7 * 24 * 60 * 60  # SigV4 presigned URLs max out at 7 days
 # Guards against oversized downloads; ~20 min of 320 kbps MP3. Override with MAX_INPUT_BYTES.
@@ -145,18 +146,35 @@ def _format_args(output_format: str, mp3_bitrate: int) -> list[str]:
     return []
 
 
+def _upload_file(
+    storage: R2Storage, path: pathlib.Path, job_id: str, filename: str, content_type: str
+) -> Dict[str, Optional[str]]:
+    key = storage.key_for(job_id, filename)
+    storage.upload(path, key, content_type)
+    # Only hand out a URL once the object is confirmed to be in R2.
+    url = storage.url_for(key) if storage.exists(key) else None
+    return {"filename": filename, "key": key, "url": url}
+
+
 def _upload_stems(
     storage: R2Storage, stems_dir: pathlib.Path, job_id: str, output_format: str
 ) -> Dict[str, Dict[str, Optional[str]]]:
-    stems: Dict[str, Dict[str, Optional[str]]] = {}
     content_type = OUTPUT_CONTENT_TYPES[output_format]
-    for stem_file in sorted(stems_dir.glob(f"*.{output_format}")):
-        key = storage.key_for(job_id, stem_file.name)
-        storage.upload(stem_file, key, content_type)
-        # Only hand out a URL once the object is confirmed to be in R2.
-        url = storage.url_for(key) if storage.exists(key) else None
-        stems[stem_file.stem] = {"filename": stem_file.name, "key": key, "url": url}
-    return stems
+    return {
+        stem_file.stem: _upload_file(storage, stem_file, job_id, stem_file.name, content_type)
+        for stem_file in sorted(stems_dir.glob(f"*.{output_format}"))
+    }
+
+
+def _transcribe_notes(audio_path: pathlib.Path, out_dir: pathlib.Path, env: Dict[str, str]) -> pathlib.Path:
+    # Spotify Basic Pitch writes <input stem>_basic_pitch.csv (plus a MIDI file we don't upload).
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cmd = ["basic-pitch", str(out_dir), str(audio_path), "--save-note-events"]
+    subprocess.run(cmd, check=True, env=env, cwd=out_dir)
+    csv_files = sorted(out_dir.glob("*.csv"))
+    if not csv_files:
+        raise FileNotFoundError("Basic Pitch did not produce a note events CSV")
+    return csv_files[0]
 
 
 def handler(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -191,6 +209,7 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         tmp_path = pathlib.Path(tmp_dir)
         audio_path = tmp_path / INPUT_KEY_FILE
         output_root = tmp_path / "separations"
+        notes_root = tmp_path / "notes"
 
         try:
             storage = R2Storage()
@@ -221,6 +240,9 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
 
             stems_dir = _find_stems_dir(output_root, model_name)
 
+            _progress(event, {**base_payload, "stage": "transcribing", "stems": None})
+            note_events_path = _transcribe_notes(audio_path, notes_root, env)
+
             _progress(event, {**base_payload, "stage": "uploading", "stems": None})
             stems_payload = _upload_stems(storage, stems_dir, job_id, output_format)
             if not stems_payload:
@@ -228,6 +250,9 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
             missing = [name for name, stem in stems_payload.items() if not stem["url"]]
             if missing:
                 return {"error": f"Stems not found in R2 after upload: {', '.join(missing)}"}
+            note_events = _upload_file(storage, note_events_path, job_id, NOTE_EVENTS_FILENAME, "text/csv")
+            if not note_events["url"]:
+                return {"error": "Note events CSV not found in R2 after upload"}
 
             return {
                 **base_payload,
@@ -235,6 +260,7 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
                 "stage": "done",
                 "stem_count": len(stems_payload),
                 "stems": stems_payload,
+                "note_events": note_events,
             }
         except Exception as exc:  # pylint: disable=broad-except
             return {"error": str(exc)}

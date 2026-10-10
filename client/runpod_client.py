@@ -26,9 +26,9 @@ def _is_public_url(value: str) -> bool:
     return parsed.scheme in ("http", "https") and bool(parsed.netloc)
 
 
-def _download_stems(stems: Dict[str, Any], destination: pathlib.Path, timeout: int) -> None:
+def _download_files(files: Dict[str, Any], destination: pathlib.Path, timeout: int) -> None:
     destination.mkdir(parents=True, exist_ok=True)
-    for key, value in stems.items():
+    for key, value in files.items():
         url = value.get("url") if isinstance(value, dict) else None
         if not url:
             continue
@@ -146,6 +146,7 @@ def main(
     deadline = time.monotonic() + max_wait
     last_stage: Optional[str] = None
     stems: Optional[Dict[str, Any]] = None
+    note_events: Optional[Dict[str, Any]] = None
     while time.monotonic() < deadline:
         body = _request("GET", f"{base_url}/status/{job_id}", headers, timeout)
         status = body.get("status")
@@ -164,6 +165,9 @@ def main(
             stems = _stems_ready(output)
             if stems is None:
                 _fail(f"Job {job_id} completed without stem URLs: {output}")
+            raw_note_events = output.get("note_events") if isinstance(output, dict) else None
+            if isinstance(raw_note_events, dict) and raw_note_events.get("url"):
+                note_events = raw_note_events
             break
 
         time.sleep(poll_interval)
@@ -174,10 +178,14 @@ def main(
 
     for name, stem in stems.items():
         typer.echo(f"{name}: {stem['url']}")
+    if note_events:
+        typer.echo(f"note_events: {note_events['url']}")
 
     if download:
         destination = save_dir.expanduser().resolve()
-        _download_stems(stems, destination, timeout)
+        _download_files(stems, destination, timeout)
+        if note_events:
+            _download_files({"note_events": note_events}, destination, timeout)
         typer.secho(f"Downloaded {len(stems)} stems to {destination}", fg=typer.colors.GREEN)
 
 
